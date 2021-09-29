@@ -77,8 +77,21 @@ if [ $ngx_found = yes ]; then
 
     ngx_feature="GD WebP support"
     ngx_feature_name="NGX_HAVE_GD_WEBP"
-    ngx_feature_test="gdImagePtr img = gdImageCreateFromWebpPtr(1, NULL);
-                      (void) img"
+    ngx_feature_run=yes
+    ngx_feature_test="return ! gdSupportsFileType(\"test.webp\", 1)"
+
+    . auto/feature
+
+    ngx_feature="GD HEIC support"
+    ngx_feature_name="NGX_HAVE_GD_HEIC"
+    ngx_feature_run=yes
+    ngx_feature_test="return ! gdSupportsFileType(\"test.heic\", 1)"
+    . auto/feature
+
+    ngx_feature="GD AVIF support"
+    ngx_feature_name="NGX_HAVE_GD_AVIF"
+    ngx_feature_run=yes
+    ngx_feature_test="return ! gdSupportsFileType(\"test.avif\", 1)"
     . auto/feature
 
 else

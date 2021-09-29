@@ -321,6 +321,10 @@ syn keyword ngxDirective contained image_filter_jpeg_quality
 syn keyword ngxDirective contained image_filter_sharpen
 syn keyword ngxDirective contained image_filter_transparency
 syn keyword ngxDirective contained image_filter_webp_quality
+syn keyword ngxDirective contained image_filter_heic_quality
+syn keyword ngxDirective contained image_filter_avif_quality
+syn keyword ngxDirective contained image_filter_avif_speed
+syn keyword ngxDirective contained image_filter_output_format
 syn keyword ngxDirective contained imap_auth
 syn keyword ngxDirective contained imap_capabilities
 syn keyword ngxDirective contained imap_client_buffer

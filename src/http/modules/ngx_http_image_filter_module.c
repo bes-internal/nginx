@@ -18,6 +18,7 @@
 #define NGX_HTTP_IMAGE_RESIZE    3
 #define NGX_HTTP_IMAGE_CROP      4
 #define NGX_HTTP_IMAGE_ROTATE    5
+#define NGX_HTTP_IMAGE_CONVERT   6
 
 
 #define NGX_HTTP_IMAGE_START     0
@@ -32,6 +33,8 @@
 #define NGX_HTTP_IMAGE_GIF       2
 #define NGX_HTTP_IMAGE_PNG       3
 #define NGX_HTTP_IMAGE_WEBP      4
+#define NGX_HTTP_IMAGE_HEIC      5
+#define NGX_HTTP_IMAGE_AVIF      6
 
 
 #define NGX_HTTP_IMAGE_BUFFERED  0x08
@@ -44,7 +47,11 @@ typedef struct {
     ngx_uint_t                   angle;
     ngx_uint_t                   jpeg_quality;
     ngx_uint_t                   webp_quality;
+    ngx_int_t                    heic_quality;
+    ngx_int_t                    avif_quality;
+    ngx_int_t                    avif_speed;
     ngx_uint_t                   sharpen;
+    ngx_uint_t                   output_format;
 
     ngx_flag_t                   transparency;
     ngx_flag_t                   interlace;
@@ -54,7 +61,11 @@ typedef struct {
     ngx_http_complex_value_t    *acv;
     ngx_http_complex_value_t    *jqcv;
     ngx_http_complex_value_t    *wqcv;
+    ngx_http_complex_value_t    *hqcv;
+    ngx_http_complex_value_t    *aqcv;
+    ngx_http_complex_value_t    *ascv;
     ngx_http_complex_value_t    *shcv;
+    ngx_http_complex_value_t    *ofcv;
 
     size_t                       buffer_size;
 } ngx_http_image_filter_conf_t;
@@ -74,6 +85,7 @@ typedef struct {
 
     ngx_uint_t                   phase;
     ngx_uint_t                   type;
+    ngx_uint_t                   output_type;
     ngx_uint_t                   force;
 } ngx_http_image_filter_ctx_t;
 
@@ -102,6 +114,8 @@ static u_char *ngx_http_image_out(ngx_http_request_t *r, ngx_uint_t type,
 static void ngx_http_image_cleanup(void *data);
 static ngx_uint_t ngx_http_image_filter_get_value(ngx_http_request_t *r,
     ngx_http_complex_value_t *cv, ngx_uint_t v);
+static ngx_uint_t ngx_http_image_filter_get_output_format(ngx_http_request_t *r,
+    ngx_http_complex_value_t *cv, ngx_uint_t v);
 static ngx_uint_t ngx_http_image_filter_value(ngx_str_t *value);
 
 
@@ -113,6 +127,12 @@ static char *ngx_http_image_filter(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_image_filter_jpeg_quality(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_image_filter_webp_quality(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_image_filter_heic_quality(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_image_filter_avif_quality(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_image_filter_avif_speed(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_image_filter_sharpen(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -138,6 +158,27 @@ static ngx_command_t  ngx_http_image_filter_commands[] = {
     { ngx_string("image_filter_webp_quality"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_http_image_filter_webp_quality,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("image_filter_heic_quality"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_image_filter_heic_quality,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("image_filter_avif_quality"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_image_filter_avif_quality,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("image_filter_avif_speed"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_image_filter_avif_speed,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -213,7 +254,19 @@ static ngx_str_t  ngx_http_image_types[] = {
     ngx_string("image/jpeg"),
     ngx_string("image/gif"),
     ngx_string("image/png"),
-    ngx_string("image/webp")
+    ngx_string("image/webp"),
+    ngx_string("image/heic"),
+    ngx_string("image/avif")
+};
+
+static ngx_str_t  ngx_http_image_output_types[] = {
+    ngx_string("input"),
+    ngx_string("jpeg"),
+    ngx_string("gif"),
+    ngx_string("png"),
+    ngx_string("webp"),
+    ngx_string("heic"),
+    ngx_string("avif")
 };
 
 
@@ -336,8 +389,15 @@ ngx_http_image_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
 
         /* override content type */
+        ctx->output_type = ngx_http_image_filter_get_output_format(r,
+                                              conf->ofcv, conf->output_format);
+        if (ctx->output_type == NGX_HTTP_IMAGE_NONE
+            || ctx->output_type == NGX_CONF_UNSET_UINT) {
 
-        ct = &ngx_http_image_types[ctx->type - 1];
+            ctx->output_type = ctx->type;
+        }
+
+        ct = &ngx_http_image_types[ctx->output_type - 1];
         r->headers_out.content_type_len = ct->len;
         r->headers_out.content_type = *ct;
         r->headers_out.content_type_lowcase = NULL;
@@ -423,7 +483,9 @@ ngx_http_image_send(ngx_http_request_t *r, ngx_http_image_filter_ctx_t *ctx,
 static ngx_uint_t
 ngx_http_image_test(ngx_http_request_t *r, ngx_chain_t *in)
 {
-    u_char  *p;
+    u_char     *p;
+    uint32_t    heif_ftyp_len;
+    uint32_t    heif_brand_offset;
 
     p = in->buf->pos;
 
@@ -461,6 +523,55 @@ ngx_http_image_test(ngx_http_request_t *r, ngx_chain_t *in)
         /* WebP */
 
         return NGX_HTTP_IMAGE_WEBP;
+    } else if (p[4] == 'f' && p[5] == 't' && p[6] == 'y' && p[7] == 'p')
+    {
+        /* HEIF container for HEIC and AVIF */
+
+        if (p[8] == 'h' && p[9] == 'e' && p[10] == 'i' && p[11] == 'c') {
+
+            /* main brand HEIC */
+            return NGX_HTTP_IMAGE_HEIC;
+        }
+
+        if (p[8] == 'a' && p[9] == 'v' && p[10] == 'i' && p[11] == 'f') {
+
+            /* main brand AVIF */
+            return NGX_HTTP_IMAGE_AVIF;
+        }
+
+
+        heif_ftyp_len = (p[0] << 24) | (p[1] << 16) |
+                        (p[2] << 8)  | (p[3]);
+
+        if (in->buf->last - p < heif_ftyp_len) {
+            return NGX_HTTP_IMAGE_NONE;
+        }
+
+        /* iterate over compatible brands */
+        heif_brand_offset = 16;
+        while (heif_brand_offset+3 < heif_ftyp_len) {
+
+            if (p[heif_brand_offset] == 'h'
+                && p[heif_brand_offset+1] == 'e'
+                && p[heif_brand_offset+2] == 'i'
+                && p[heif_brand_offset+3] == 'c') {
+
+                return NGX_HTTP_IMAGE_HEIC;
+            }
+
+            if (p[heif_brand_offset] == 'a'
+                && p[heif_brand_offset+1] == 'v'
+                && p[heif_brand_offset+2] == 'i'
+                && p[heif_brand_offset+3] == 'f') {
+
+                return NGX_HTTP_IMAGE_AVIF;
+            }
+
+            heif_brand_offset += 4;
+        }
+
+        /* HEIC or AVIF not found in compatible brand list */
+
     }
 
     return NGX_HTTP_IMAGE_NONE;
@@ -551,6 +662,17 @@ ngx_http_image_process(ngx_http_request_t *r)
         return ngx_http_image_resize(r, ctx);
     }
 
+    if (conf->filter == NGX_HTTP_IMAGE_CONVERT) {
+
+        if (ctx->output_type == ctx->type) {
+
+            /* No conversion necessary */
+            return ngx_http_image_asis(r, ctx);
+        }
+
+        return ngx_http_image_resize(r, ctx);
+    }
+
     ctx->max_width = ngx_http_image_filter_get_value(r, conf->wcv, conf->width);
     if (ctx->max_width == 0) {
         return NULL;
@@ -566,7 +688,8 @@ ngx_http_image_process(ngx_http_request_t *r)
         && ctx->width <= ctx->max_width
         && ctx->height <= ctx->max_height
         && ctx->angle == 0
-        && !ctx->force)
+        && !ctx->force
+        && ctx->output_type == ctx->type)
     {
         return ngx_http_image_asis(r, ctx);
     }
@@ -668,6 +791,11 @@ ngx_http_image_size(ngx_http_request_t *r, ngx_http_image_filter_ctx_t *ctx)
     u_char      *p, *last;
     size_t       len, app;
     ngx_uint_t   width, height;
+    int          heif_compatible;
+    uint64_t     heif_box_len;
+    uint64_t     heif_box_offset;
+    uint64_t     heif_sub_len;
+    uint64_t     heif_sub_offset;
 
     p = ctx->image;
 
@@ -801,6 +929,196 @@ ngx_http_image_size(ngx_http_request_t *r, ngx_http_image_filter_ctx_t *ctx)
 
         break;
 
+    case NGX_HTTP_IMAGE_HEIC:
+    case NGX_HTTP_IMAGE_AVIF:
+    {
+
+        if (ctx->length < 12) {
+            return NGX_DECLINED;
+        }
+
+        /* check ftyp box */
+        heif_box_len = (p[0] << 24) | (p[1] << 16) |
+                       (p[2] << 8)  | (p[3]);
+        if (ctx->length < heif_box_len || heif_box_len < 12) {
+            return NGX_DECLINED;
+        }
+
+        if (p[4] != 'f' || p[5] != 't' || p[6]  != 'y' || p[7]  != 'p') {
+
+            return NGX_DECLINED;
+        }
+
+        heif_compatible = 0;
+
+        /* check file brand HEIC */
+        if ((ctx->type == NGX_HTTP_IMAGE_HEIC) &&
+             (p[8] == 'h') && (p[9] == 'e') && (p[10] == 'i') && (p[11] == 'c'))
+        {
+            heif_compatible = 1;
+        }
+
+        /* check file brand AVIF */
+        if ((ctx->type == NGX_HTTP_IMAGE_AVIF) &&
+             (p[8] == 'a') && (p[9] == 'v') && (p[10] == 'i') && (p[11] == 'f'))
+        {
+            heif_compatible = 1;
+        }
+
+        if (heif_compatible == 0) {
+
+            /* check compatbile brand */
+
+            /* iterate over compatible brands */
+            heif_box_offset = 16;
+            while (heif_box_offset+3 < heif_box_len) {
+
+                if (ctx->type == NGX_HTTP_IMAGE_HEIC
+                    && p[heif_box_offset] == 'h'
+                    && p[heif_box_offset+1] == 'e'
+                    && p[heif_box_offset+2] == 'i'
+                    && p[heif_box_offset+3] == 'c') {
+
+                    heif_compatible = 1;
+                    break;
+                }
+
+                if (ctx->type == NGX_HTTP_IMAGE_AVIF
+                    && p[heif_box_offset] == 'a'
+                    && p[heif_box_offset+1] == 'v'
+                    && p[heif_box_offset+2] == 'i'
+                    && p[heif_box_offset+3] == 'f') {
+
+                    heif_compatible = 1;
+                    break;
+                }
+
+                heif_box_offset += 4;
+            }
+
+            if (heif_compatible == 0) {
+                return NGX_DECLINED;
+            }
+        }
+
+        if (ctx->length < heif_box_len + 8) {
+            return NGX_DECLINED;
+        }
+
+        /* continue with boxes after ftyp */
+
+        heif_box_offset = heif_box_len;
+        heif_box_len = 0;
+        /* skip boxes until meta box */
+        while (heif_box_offset+8 < ctx->length) {
+
+            /* read box length */
+            heif_box_len = (p[heif_box_offset] << 24)
+                            | (p[heif_box_offset+1] << 16)
+                            | (p[heif_box_offset+2] << 8)
+                            | (p[heif_box_offset+3]);
+            /* check for extended length */
+            if (heif_box_len == 1) {
+                if (heif_box_offset+16 >= ctx->length) {
+                    return NGX_DECLINED;
+                }
+                heif_box_len = (((uint64_t) p[heif_box_offset+8])  << 56)
+                               | (((uint64_t) p[heif_box_offset+9])  << 48)
+                               | (((uint64_t) p[heif_box_offset+10]) << 40)
+                               | (((uint64_t) p[heif_box_offset+11]) << 32)
+                               | (p[heif_box_offset+12] << 24)
+                               | (p[heif_box_offset+13] << 16)
+                               | (p[heif_box_offset+14] <<  8)
+                               | (p[heif_box_offset+15]);
+            }
+            /* check for box type, if meta box break loop */
+            if ((p[heif_box_offset+4] == 'm')
+                && (p[heif_box_offset+5] == 'e')
+                && (p[heif_box_offset+6] == 't')
+                && (p[heif_box_offset+7] == 'a')) {
+
+                break;
+            }
+            /* skip box */
+            heif_box_offset += heif_box_len;
+        }
+        /* check if meta box len is included in buffer */
+        if (ctx->length < heif_box_offset + heif_box_len || heif_box_len < 12) {
+            return NGX_DECLINED;
+        }
+        /* iterate over meta subboxes */
+        heif_sub_offset = heif_box_offset + 12; /* offset of first subbox */
+        /* check if ispe subbox fits in meta box */
+        while (heif_sub_offset + 19 < heif_box_offset + heif_box_len) {
+
+            heif_sub_len = (p[heif_sub_offset]   << 24)
+                            | (p[heif_sub_offset+1] << 16)
+                            | (p[heif_sub_offset+2] << 8)
+                            | (p[heif_sub_offset+3]);
+
+            /* ispe - image spatial extents */
+            if ((p[heif_sub_offset+4] == 'i')
+                && (p[heif_sub_offset+5] == 's')
+                && (p[heif_sub_offset+6] == 'p')
+                && (p[heif_sub_offset+7] == 'e')) {
+
+                width = (p[heif_sub_offset+12]  << 24)
+                         | (p[heif_sub_offset+13] << 16)
+                         | (p[heif_sub_offset+14] << 8)
+                         | (p[heif_sub_offset+15]);
+                height = (p[heif_sub_offset+16] << 24)
+                          | (p[heif_sub_offset+17] << 16)
+                          | (p[heif_sub_offset+18] << 8)
+                          | (p[heif_sub_offset+19]);
+                break;
+            }
+
+            /* iprp */
+            if ((p[heif_sub_offset+4] == 'i')
+                && (p[heif_sub_offset+5] == 'p')
+                && (p[heif_sub_offset+6] == 'r')
+                && (p[heif_sub_offset+7] == 'p')) {
+
+                /* ignore container box header, continue reading box children */
+                heif_sub_offset += 8;
+
+            } else
+            if ((p[heif_sub_offset+4] == 'i')
+                && (p[heif_sub_offset+5] == 'p')
+                && (p[heif_sub_offset+6] == 'c')
+                && (p[heif_sub_offset+7] == 'o')) {
+
+                /* ignore container box header, continue reading box children */
+                heif_sub_offset += 8;
+
+            } else
+            if (heif_sub_len != 0) {
+                /* skip to next subbox */
+                if (heif_sub_len == 1) {
+                    /* box length is extended */
+                    /* read and skip extended length */
+                    heif_sub_offset +=
+                        (((uint64_t) p[heif_sub_offset+8])  << 56)
+                        | (((uint64_t) p[heif_sub_offset+9])  << 48)
+                        | (((uint64_t) p[heif_sub_offset+10]) << 40)
+                        | (((uint64_t) p[heif_sub_offset+11]) << 32)
+                        | (p[heif_sub_offset+12] << 24)
+                        | (p[heif_sub_offset+13] << 16)
+                        | (p[heif_sub_offset+14] <<  8)
+                        | (p[heif_sub_offset+15]);
+                } else {
+                    heif_sub_offset += heif_sub_len;
+                }
+            } else {
+                /* box with zero length continues until EOF */
+                return NGX_DECLINED;
+            }
+        }
+        if (heif_sub_offset + 19 >= heif_box_offset + heif_box_len) {
+            return NGX_DECLINED;
+        }
+        break;
+    }
     default:
 
         return NGX_DECLINED;
@@ -843,7 +1161,8 @@ ngx_http_image_resize(ngx_http_request_t *r, ngx_http_image_filter_ctx_t *ctx)
     if (!ctx->force
         && ctx->angle == 0
         && (ngx_uint_t) sx <= ctx->max_width
-        && (ngx_uint_t) sy <= ctx->max_height)
+        && (ngx_uint_t) sy <= ctx->max_height
+        && ctx->output_type == ctx->type)
     {
         gdImageDestroy(src);
         return ngx_http_image_asis(r, ctx);
@@ -873,6 +1192,12 @@ ngx_http_image_resize(ngx_http_request_t *r, ngx_http_image_filter_ctx_t *ctx)
 transparent:
 
     gdImageColorTransparent(src, -1);
+
+    /* no operation, just convert untouched image */
+    if (conf->filter == NGX_HTTP_IMAGE_CONVERT) {
+        dst = src;
+        goto output;
+    }
 
     dx = sx;
     dy = sy;
@@ -1049,7 +1374,8 @@ transparent:
 
     gdImageInterlace(dst, (int) conf->interlace);
 
-    out = ngx_http_image_out(r, ctx->type, dst, &size);
+output:
+    out = ngx_http_image_out(r, ctx->output_type, dst, &size);
 
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "image: %d x %d %d", sx, sy, colors);
@@ -1122,6 +1448,24 @@ ngx_http_image_source(ngx_http_request_t *r, ngx_http_image_filter_ctx_t *ctx)
 #endif
         break;
 
+    case NGX_HTTP_IMAGE_HEIC:
+#if (NGX_HAVE_GD_HEIC)
+        img = gdImageCreateFromHeifPtr(ctx->length, ctx->image);
+        failed = "gdImageCreateFromHeifPtr() failed";
+#else
+        failed = "nginx was built without GD HEIC support";
+#endif
+        break;
+
+    case NGX_HTTP_IMAGE_AVIF:
+#if (NGX_HAVE_GD_AVIF)
+        img = gdImageCreateFromAvifPtr(ctx->length, ctx->image);
+        failed = "gdImageCreateFromAvifPtr() failed";
+#else
+        failed = "nginx was built without GD AVIF support";
+#endif
+        break;
+
     default:
         failed = "unknown image type";
         break;
@@ -1170,6 +1514,7 @@ ngx_http_image_out(ngx_http_request_t *r, ngx_uint_t type, gdImagePtr img,
     char                          *failed;
     u_char                        *out;
     ngx_int_t                      q;
+    ngx_int_t                      s;
     ngx_http_image_filter_conf_t  *conf;
 
     out = NULL;
@@ -1213,6 +1558,44 @@ ngx_http_image_out(ngx_http_request_t *r, ngx_uint_t type, gdImagePtr img,
         failed = "nginx was built without GD WebP support";
 #endif
         break;
+
+    case NGX_HTTP_IMAGE_HEIC:
+#if (NGX_HAVE_GD_HEIC)
+        conf = ngx_http_get_module_loc_conf(r, ngx_http_image_filter_module);
+
+        q = ngx_http_image_filter_get_value(r, conf->hqcv, conf->heic_quality);
+        if (q != -1 && q != 200 && ( q < 0 || q > 100 ) ) {
+            return NULL;
+        }
+
+        out = gdImageHeifPtrEx(img, size, q, GD_HEIF_CODEC_HEVC,
+                GD_HEIF_CHROMA_444);
+        failed = "gdImageHeifPtrEx() failed";
+#else
+        failed = "nginx was built without GD HEIC support";
+#endif
+        break;
+
+    case NGX_HTTP_IMAGE_AVIF:
+#if (NGX_HAVE_GD_AVIF)
+        conf = ngx_http_get_module_loc_conf(r, ngx_http_image_filter_module);
+
+        q = ngx_http_image_filter_get_value(r, conf->aqcv, conf->avif_quality);
+        if (q != -1 && ( q < 0 || q > 100 ) ) {
+            return NULL;
+        }
+        s = ngx_http_image_filter_get_value(r, conf->ascv, conf->avif_speed);
+        if (s != -1 && ( s < 0 || s > 10 ) ) {
+            return NULL;
+        }
+
+        out = gdImageAvifPtrEx(img, size, q, s);
+        failed = "gdImageAvifPtrEx() failed";
+#else
+        failed = "nginx was built without GD AVIF support";
+#endif
+        break;
+
 
     default:
         failed = "unknown image type";
@@ -1271,6 +1654,35 @@ ngx_http_image_filter_value(ngx_str_t *value)
 }
 
 
+static ngx_uint_t
+ngx_http_image_filter_get_output_format(ngx_http_request_t *r,
+    ngx_http_complex_value_t *cv, ngx_uint_t v)
+{
+    ngx_str_t  val;
+    ngx_uint_t of = NGX_CONF_UNSET_UINT;
+
+    if (cv == NULL) {
+        return v;
+    }
+
+    if (ngx_http_complex_value(r, cv, &val) != NGX_OK) {
+        return v;
+    }
+    for (uint i = 0; i < 7; i++) {
+        if (val.len == ngx_http_image_output_types[i].len
+            && ngx_strncmp(ngx_http_image_output_types[i].data, val.data,
+                           ngx_http_image_output_types[i].len) == 0) {
+            of = i;
+            break;
+        }
+    }
+    if (of == NGX_CONF_UNSET_UINT) {
+        return v;
+    }
+    return of;
+}
+
+
 static void *
 ngx_http_image_filter_create_conf(ngx_conf_t *cf)
 {
@@ -1293,15 +1705,20 @@ ngx_http_image_filter_create_conf(ngx_conf_t *cf)
      *     conf->jqcv = NULL;
      *     conf->wqcv = NULL;
      *     conf->shcv = NULL;
+     *     conf->ofcv = NULL;
      */
 
     conf->filter = NGX_CONF_UNSET_UINT;
     conf->jpeg_quality = NGX_CONF_UNSET_UINT;
     conf->webp_quality = NGX_CONF_UNSET_UINT;
+    conf->heic_quality = NGX_CONF_UNSET;
+    conf->avif_quality = NGX_CONF_UNSET;
+    conf->avif_speed = NGX_CONF_UNSET;
     conf->sharpen = NGX_CONF_UNSET_UINT;
     conf->transparency = NGX_CONF_UNSET;
     conf->interlace = NGX_CONF_UNSET;
     conf->buffer_size = NGX_CONF_UNSET_SIZE;
+    conf->output_format = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
@@ -1349,6 +1766,33 @@ ngx_http_image_filter_merge_conf(ngx_conf_t *cf, void *parent, void *child)
         }
     }
 
+    if (conf->heic_quality == NGX_CONF_UNSET) {
+        ngx_conf_merge_value(conf->heic_quality, prev->heic_quality,
+                             NGX_CONF_UNSET);
+
+        if (conf->hqcv == NULL) {
+            conf->hqcv = prev->hqcv;
+        }
+    }
+
+    if (conf->avif_quality == NGX_CONF_UNSET) {
+        ngx_conf_merge_value(conf->avif_quality, prev->avif_quality,
+                             NGX_CONF_UNSET);
+
+        if (conf->aqcv == NULL) {
+            conf->aqcv = prev->aqcv;
+        }
+    }
+
+    if (conf->avif_speed == NGX_CONF_UNSET) {
+        ngx_conf_merge_value(conf->avif_speed, prev->avif_speed,
+                             NGX_CONF_UNSET);
+
+        if (conf->ascv == NULL) {
+            conf->ascv = prev->ascv;
+        }
+    }
+
     if (conf->sharpen == NGX_CONF_UNSET_UINT) {
         ngx_conf_merge_uint_value(conf->sharpen, prev->sharpen, 0);
 
@@ -1356,6 +1800,16 @@ ngx_http_image_filter_merge_conf(ngx_conf_t *cf, void *parent, void *child)
             conf->shcv = prev->shcv;
         }
     }
+
+    if (conf->output_format == NGX_CONF_UNSET_UINT) {
+        ngx_conf_merge_uint_value(conf->output_format, prev->output_format,
+                                  NGX_HTTP_IMAGE_NONE);
+
+        if (conf->ofcv == NULL) {
+            conf->ofcv = prev->ofcv;
+        }
+    }
+
 
     ngx_conf_merge_value(conf->transparency, prev->transparency, 1);
 
@@ -1435,6 +1889,56 @@ ngx_http_image_filter(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 }
 
                 *imcf->acv = cv;
+            }
+
+            return NGX_CONF_OK;
+
+        } else if (ngx_strcmp(value[i].data, "convert") == 0) {
+
+            /* set filter to convert if no other filter is active */
+            if (imcf->filter == NGX_CONF_UNSET_UINT
+                || imcf->filter == NGX_HTTP_IMAGE_OFF) {
+
+                imcf->filter = NGX_HTTP_IMAGE_CONVERT;
+            }
+
+            /* check output format parameter */
+            ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+            ccv.cf = cf;
+            ccv.value = &value[++i];
+            ccv.complex_value = &cv;
+
+            if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+                return NGX_CONF_ERROR;
+            }
+
+            if (cv.lengths == NULL) {
+
+                n = NGX_CONF_UNSET;
+                for (uint j = 0; j < 7; j++) {
+                    if (ngx_strncmp(ngx_http_image_output_types[j].data, value[i].data,
+                                    ngx_http_image_output_types[j].len) == 0) {
+                        n = j;
+                        break;
+                    }
+                }
+                if (n == NGX_CONF_UNSET) {
+
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid parameter \"%V\"",
+                                   &value[i]);
+
+                    return NGX_CONF_ERROR;
+                }
+                imcf->output_format = (ngx_uint_t) n;
+
+            } else {
+                imcf->ofcv = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+                if (imcf->ofcv == NULL) {
+                    return NGX_CONF_ERROR;
+                }
+
+                *imcf->ofcv = cv;
             }
 
             return NGX_CONF_OK;
@@ -1609,6 +2113,147 @@ ngx_http_image_filter_webp_quality(ngx_conf_t *cf, ngx_command_t *cmd,
         }
 
         *imcf->wqcv = cv;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_http_image_filter_heic_quality(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_image_filter_conf_t *imcf = conf;
+
+    ngx_str_t                         *value;
+    ngx_int_t                          n;
+    ngx_http_complex_value_t           cv;
+    ngx_http_compile_complex_value_t   ccv;
+
+    value = cf->args->elts;
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = &cv;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (cv.lengths == NULL) {
+        n = ngx_http_image_filter_value(&value[1]);
+
+        if (n != 200 && (n < 0 || n > 100)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid value \"%V\"", &value[1]);
+            return NGX_CONF_ERROR;
+        }
+
+        imcf->heic_quality = n;
+
+    } else {
+        imcf->hqcv = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+        if (imcf->hqcv == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        *imcf->hqcv = cv;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_http_image_filter_avif_quality(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_image_filter_conf_t *imcf = conf;
+
+    ngx_str_t                         *value;
+    ngx_int_t                          n;
+    ngx_http_complex_value_t           cv;
+    ngx_http_compile_complex_value_t   ccv;
+
+    value = cf->args->elts;
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = &cv;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (cv.lengths == NULL) {
+        n = ngx_http_image_filter_value(&value[1]);
+
+        if (n < 0 || n > 100) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid value \"%V\"", &value[1]);
+            return NGX_CONF_ERROR;
+        }
+
+        imcf->avif_quality = n;
+
+    } else {
+        imcf->aqcv = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+        if (imcf->aqcv == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        *imcf->aqcv = cv;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_http_image_filter_avif_speed(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_image_filter_conf_t *imcf = conf;
+
+    ngx_str_t                         *value;
+    ngx_int_t                          n;
+    ngx_http_complex_value_t           cv;
+    ngx_http_compile_complex_value_t   ccv;
+
+    value = cf->args->elts;
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = &cv;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (cv.lengths == NULL) {
+        n = ngx_http_image_filter_value(&value[1]);
+
+        if (n < 0 || n > 10) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid value \"%V\"", &value[1]);
+            return NGX_CONF_ERROR;
+        }
+
+        imcf->avif_speed = n;
+
+    } else {
+        imcf->ascv = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+        if (imcf->ascv == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        *imcf->ascv = cv;
     }
 
     return NGX_CONF_OK;
